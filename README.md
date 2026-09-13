@@ -27,6 +27,7 @@ app/
   models.py             Pydantic models: TeamMember, CompanyExtraction, EnrichedCompany, PipelineOutput
   crawler.py            Async Playwright crawler — discovers and fetches relevant subpages
   extractor.py          HTML → clean plain text (BeautifulSoup, dedup, whitespace normalization)
+  search.py             Lightweight targeted web-search fallback (Serper API)
   llm.py                Groq structured extraction + token/cost tracking
   pipeline.py           Per-domain orchestration + deterministic confidence scoring
   utils.py              URL helpers, logging setup, JSON writer
@@ -52,6 +53,11 @@ Domain list
     │             Strips scripts/styles/nav/footer
     │             Normalises whitespace, deduplicates lines
     │             Truncates to token-safe limits
+    ▼
+[search.py]  ── Web Search Fallback (Serper.dev API, if SEARCH_ENABLED=true)
+    │             Detects missing signals (leadership, LinkedIn URLs, contact emails)
+    │             Runs targeted search queries only for missing fields
+    │             Appends evidence text to LLM context (0 extra LLM calls)
     ▼
 [llm.py]  ── Groq API (openai/gpt-oss-20b)
     │         Strict JSON Schema structured output
@@ -316,6 +322,9 @@ Each domain is wrapped in an independent try/except block. Errors are logged and
 | `MAX_CHARS_PER_PAGE` | `4000` | Char limit per page before combining |
 | `MAX_CHARS_COMBINED` | `24000` | Total char limit sent to the LLM |
 | `OUTPUT_FILE` | `output/output.json` | Path for JSON output |
+| `SEARCH_ENABLED` | `false` | Enable web-search enrichment fallback |
+| `SEARCH_API_KEY` | `""` | Serper.dev API key for Google search |
+| `SEARCH_MAX_RESULTS` | `3` | Max search results per query |
 
 ---
 
@@ -324,7 +333,7 @@ Each domain is wrapped in an independent try/except block. Errors are logged and
 - **Bot blockers**: Some Cloudflare-protected sites may return empty pages. Handled gracefully.
 - **JavaScript SPAs**: The crawler waits for `networkidle` (5s timeout) as a best-effort measure.
 - **Dynamic pricing**: Client-side rendered pricing may not appear in the DOM snapshot.
-- **LinkedIn URLs**: Only included when they appear verbatim in the page content.
+- **LinkedIn URLs**: Only included when they appear verbatim in the page content or search evidence.
 - **Rate limits**: Groq free-tier has per-minute token limits; the pipeline retries automatically.
 
 ---
@@ -334,8 +343,13 @@ Each domain is wrapped in an independent try/except block. Errors are logged and
 ### Token / Cost Tracking ✅ (implemented)
 Every run reports total tokens consumed and estimated USD cost in the summary and in `output/output.json` under `token_usage`.
 
-### LinkedIn / Search Integration ❌ (not implemented)
-Marked as optional in the assignment spec. Core requirements take priority.
+### Web Search Fallback Enrichment ✅ (implemented)
+When enabled via `SEARCH_ENABLED=true` in `.env` with a `SEARCH_API_KEY` (Serper.dev), the pipeline:
+1. Detects missing signals in crawled website text (`leadership`, `linkedin`, `contact`).
+2. Runs targeted, company-scoped Google searches ONLY for missing fields.
+3. Appends clean search snippets to the LLM context prior to extraction (0 extra LLM calls).
+4. Adds search result URLs to domain `sources` in `output/output.json`.
+5. Non-fatal: search timeouts or errors never fail a domain or interrupt the pipeline.
 
 ---
 
@@ -350,6 +364,7 @@ Marked as optional in the assignment spec. Core requirements take priority.
 │   ├── models.py
 │   ├── crawler.py
 │   ├── extractor.py
+│   ├── search.py
 │   ├── llm.py
 │   ├── pipeline.py
 │   └── utils.py
@@ -360,3 +375,4 @@ Marked as optional in the assignment spec. Core requirements take priority.
 ├── .gitignore
 └── README.md
 ```
+

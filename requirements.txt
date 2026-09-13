@@ -13,3 +13,6 @@ pydantic>=2.7.0
 
 # ── Environment variable loading ─────────────────────────────────────────────
 python-dotenv>=1.0.0
+
+# ── HTTP Requests / Web Search ────────────────────────────────────────────────
+requests>=2.31.0

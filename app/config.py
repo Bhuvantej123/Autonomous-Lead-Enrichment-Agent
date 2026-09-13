@@ -34,6 +34,11 @@ MAX_CHARS_COMBINED: int = int(os.getenv("MAX_CHARS_COMBINED", "24000"))
 # ── Output ────────────────────────────────────────────────────────────────────
 OUTPUT_FILE: str = os.getenv("OUTPUT_FILE", "output/output.json")
 
+# ── Web Search Enrichment (Fallback) ─────────────────────────────────────────
+SEARCH_ENABLED: bool = os.getenv("SEARCH_ENABLED", "false").lower() in ("true", "1", "yes")
+SEARCH_API_KEY: str = os.getenv("SEARCH_API_KEY", "")
+SEARCH_MAX_RESULTS: int = int(os.getenv("SEARCH_MAX_RESULTS", "3"))
+
 # ── URL path keywords that indicate a relevant subpage ───────────────────────
 RELEVANT_PATH_KEYWORDS: list[str] = [
     "about",

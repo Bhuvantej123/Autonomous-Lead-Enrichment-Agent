@@ -142,20 +142,24 @@ _RESPONSE_FORMAT_OBJECT = {"type": "json_object"}   # fallback only
 
 _SYSTEM_PROMPT = """\
 You are a company intelligence analyst. You will be given clean text extracted \
-from a company's public website pages. You must return a valid json object \
-matching the provided schema exactly.
+from a company's public website pages, optionally supplemented with web search evidence. \
+You must return a valid json object matching the provided schema exactly.
 
 Rules:
 1. NEVER invent or hallucinate information. If you cannot find something, \
    use empty string "" or empty list [].
-2. company_overview: Exactly 2 sentences describing what the company does \
+2. SOURCE PRIORITY: First-party website content is authoritative. Web search evidence \
+   is strictly supplementary and may ONLY be used to fill fields that are genuinely \
+   absent from website content. Search evidence must NEVER override, contradict, \
+   or modify information already supported by the website.
+3. company_overview: Exactly 2 sentences describing what the company does \
    and its main product or service.
-3. target_audience: Who the company's ideal customers are (ICP). Be specific.
-4. contact_points: Only include email addresses that appear LITERALLY in the \
+4. target_audience: Who the company's ideal customers are (ICP). Be specific.
+5. contact_points: Only include email addresses that appear LITERALLY in the \
    text. Do NOT guess or construct emails.
-5. leadership: Only include people explicitly mentioned by name and role. \
+6. leadership: Only include people explicitly mentioned by name and role. \
    linkedin_url must appear verbatim in the text or be null.
-6. confidence_score: Float 0.0-1.0 rating your confidence in the extraction.
+7. confidence_score: Float 0.0-1.0 rating your confidence in the extraction.
 """
 
 

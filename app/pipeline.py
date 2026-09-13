@@ -18,6 +18,7 @@ from app.crawler import crawl_domains
 from app.extractor import combine_pages, extract_text
 from app.llm import extract_company_info
 from app.models import EnrichedCompany, PipelineOutput, TokenUsage
+from app.search import enrich_with_search
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,20 @@ def process_domain(domain: str, page_contents) -> tuple[EnrichedCompany, TokenUs
         domain,
     )
 
+    # Search enrichment fallback (runs if missing leadership, LinkedIn, or contact info)
+    combined_text = extracted_content.combined_text
+    search_evidence = enrich_with_search(domain=domain, extracted_text=combined_text)
+    if search_evidence.found_anything:
+        combined_text += search_evidence.as_text()
+        for src in search_evidence.sources:
+            if src not in sources:
+                sources.append(src)
+
     # LLM extraction
     try:
         company_data, token_usage = extract_company_info(
             domain=domain,
-            combined_text=extracted_content.combined_text,
+            combined_text=combined_text,
         )
     except Exception as exc:
         logger.error("LLM extraction failed for %s: %s", domain, exc)
