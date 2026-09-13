@@ -1,6 +1,6 @@
 # Autonomous Lead Enrichment Agent
 
-A production-quality Python pipeline that accepts a list of company domains, autonomously crawls their public websites using a headless Chromium browser, extracts clean structured text, and uses an LLM (OpenAI) to produce actionable company intelligence in JSON format.
+A production-quality Python pipeline that accepts a list of company domains, autonomously crawls their public websites using a headless Chromium browser, extracts clean structured text, and uses **Groq** with **strict JSON Schema structured outputs** to produce actionable company intelligence in JSON format.
 
 ---
 
@@ -11,8 +11,8 @@ Given a list of domains such as `postman.com`, `supabase.com`, and `vapi.ai`, th
 1. Visits each company's homepage with Playwright (headless Chromium).
 2. Discovers and scores internal subpages (`/about`, `/team`, `/contact`, `/pricing`, `/leadership`, etc.).
 3. Extracts visible text from the DOM — removing scripts, styles, navigation, and boilerplate.
-4. Combines the clean text and sends it to an OpenAI LLM with a structured extraction prompt.
-5. Returns a validated Pydantic model containing company overview, ICP, contacts, leadership, and a confidence score.
+4. Combines the clean text and sends it to the Groq LLM with a structured JSON Schema extraction prompt.
+5. Returns a Pydantic-validated model containing company overview, ICP, contacts, leadership, and a confidence score.
 6. Writes all results to `output/output.json`.
 
 ---
@@ -27,7 +27,7 @@ app/
   models.py             Pydantic models: TeamMember, CompanyExtraction, EnrichedCompany, PipelineOutput
   crawler.py            Async Playwright crawler — discovers and fetches relevant subpages
   extractor.py          HTML → clean plain text (BeautifulSoup, dedup, whitespace normalization)
-  llm.py                OpenAI structured extraction + token/cost tracking
+  llm.py                Groq structured extraction + token/cost tracking
   pipeline.py           Per-domain orchestration + deterministic confidence scoring
   utils.py              URL helpers, logging setup, JSON writer
 output/
@@ -45,7 +45,7 @@ Domain list
     │
     ▼
 [crawler.py]  ── Playwright headless Chromium
-    │            Discovers relevant subpages
+    │            Discovers relevant subpages by keyword scoring
     │            Fetches HTML (handles JS, redirects, 404s, timeouts)
     ▼
 [extractor.py] ── BeautifulSoup
@@ -53,12 +53,13 @@ Domain list
     │             Normalises whitespace, deduplicates lines
     │             Truncates to token-safe limits
     ▼
-[llm.py]  ── OpenAI beta.chat.completions.parse()
-    │         Structured Pydantic output (CompanyExtraction)
-    │         Temperature=0 for deterministic extraction
+[llm.py]  ── Groq API (openai/gpt-oss-20b)
+    │         Strict JSON Schema structured output
+    │         Schema derived from CompanyExtraction.model_json_schema()
+    │         Pydantic second-layer validation
     ▼
-[pipeline.py]  ── Computes deterministic confidence score
-    │             Wraps result in EnrichedCompany
+[pipeline.py]  ── Deterministic confidence scoring
+    │             Per-domain error isolation
     ▼
 output/output.json
 ```
@@ -70,11 +71,56 @@ output/output.json
 - **Headless browser crawling** via Playwright — handles JavaScript-rendered pages, redirects, and SPAs.
 - **Smart subpage discovery** — scores and prioritises pages by keyword relevance, stays on the same domain.
 - **Clean text extraction** — removes all HTML noise before sending to the LLM (see rationale below).
-- **Structured LLM output** — uses `client.beta.chat.completions.parse()` with a Pydantic schema so the output is always machine-parseable.
-- **Deterministic confidence scoring** — blends objective completeness signals (fields found, pages crawled) with LLM confidence.
+- **Strict JSON Schema structured outputs** — Groq enforces the schema at generation time using the schema derived from the Pydantic `CompanyExtraction` model.
+- **Pydantic as second validation layer** — the parsed response is validated by Pydantic after API return.
+- **Deterministic confidence scoring** — blends objective completeness signals with LLM confidence.
 - **Robust error handling** — every domain is isolated; one failure never crashes the run.
 - **Token and cost tracking** — reports total tokens used and estimated USD cost per run.
 - **Configurable via `.env`** — no hardcoded keys, models, or limits.
+
+---
+
+## LLM Provider and Structured Outputs
+
+### Provider
+**[Groq](https://groq.com)** — fast inference API compatible with OpenAI-style chat completions.
+
+### Model
+`openai/gpt-oss-20b` (configurable via `GROQ_MODEL` env var)
+
+### Structured Output Implementation
+
+The assignment requires strict structured outputs. The implementation uses **Groq's `json_schema` response format** with `strict: true`:
+
+```python
+response_format = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "company_extraction",
+        "strict": True,
+        "schema": CompanyExtraction.model_json_schema(),  # derived from Pydantic
+    }
+}
+```
+
+The schema is post-processed by `_make_strict_schema()` in `app/llm.py` to satisfy Groq strict mode:
+- All object properties are added to `required` (including those with Pydantic defaults).
+- `additionalProperties: false` is set on every object.
+- `default` values are stripped (not supported in strict mode).
+- `TeamMember.linkedin_url` is typed as `anyOf: [string, null]` — explicitly supporting null when not discoverable.
+
+**`app/models.py` is the single source of truth.** The schema is never duplicated or hardcoded in `llm.py`.
+
+### Validation Layers
+
+| Layer | Where | What |
+|---|---|---|
+| 1 — API | Groq server | Enforces JSON Schema at generation time |
+| 2 — Code | `app/llm.py` | Pydantic validates the parsed dict |
+
+### Fallback
+
+If the model returns `json_validate_failed` on very large contexts, the pipeline automatically retries with `json_object` mode and a trimmed 12k-character context. Pydantic validation still applies.
 
 ---
 
@@ -82,25 +128,18 @@ output/output.json
 
 Raw HTML contains thousands of tokens of irrelevant noise:
 - `<script>` and `<style>` blocks
-- SVG path data
-- CSS class names and HTML attributes
-- Tracking pixels, analytics snippets
+- SVG path data and CSS class names
+- Tracking pixels and analytics snippets
 - Repeated navigation and footer markup
 
-Sending raw HTML to an LLM would:
-- **Waste context window** — leaving less room for actual content.
-- **Increase cost** — more tokens = higher API cost.
-- **Degrade extraction quality** — the model attends to noise instead of content.
-- **Risk hitting token limits** — large pages can easily exceed 16K tokens of raw HTML.
-
-The extractor strips all of the above, normalises whitespace, and deduplicates repeated lines, giving the LLM only the meaningful visible text.
+Sending raw HTML would waste context window, increase cost, degrade extraction quality, and risk hitting token limits. The extractor strips all of the above, normalises whitespace, and deduplicates repeated lines.
 
 ---
 
 ## Prerequisites
 
 - Python 3.11+
-- An OpenAI API key with access to `gpt-4o-mini` (or your chosen model)
+- A Groq API key — free at [console.groq.com](https://console.groq.com)
 - Internet access (the crawler visits live websites)
 
 ---
@@ -146,11 +185,11 @@ playwright install chromium
 cp .env.example .env
 ```
 
-Open `.env` and set your `OPENAI_API_KEY`:
+Open `.env` and set your `GROQ_API_KEY`:
 
 ```env
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=openai/gpt-oss-20b
 ```
 
 ---
@@ -192,21 +231,20 @@ python main.py --output results/my_run.json
   "results": [
     {
       "domain": "postman.com",
-      "company_overview": "Postman is an API platform that helps developers design, test, and collaborate on APIs. It provides a collaborative workspace used by millions of developers to build and manage APIs efficiently.",
-      "target_audience": "Software developers, API engineers, and engineering teams at companies of all sizes who need to design, test, mock, and document APIs.",
-      "contact_points": ["support@postman.com"],
+      "company_overview": "Postman is an API platform for building and using APIs. It simplifies each step of the API lifecycle and streamlines collaboration.",
+      "target_audience": "Software developers, engineering teams, and enterprises that build, test, and manage APIs.",
+      "contact_points": ["info@postman.com", "help@postman.com"],
       "leadership": [
         {
           "name": "Abhinav Asthana",
-          "role": "Co-founder & CEO",
+          "role": "CEO and co-founder",
           "linkedin_url": null
         }
       ],
-      "confidence_score": 0.85,
+      "confidence_score": 0.99,
       "sources": [
         "https://postman.com",
-        "https://postman.com/about",
-        "https://postman.com/company/contact-us"
+        "https://www.postman.com/company/about-postman/"
       ],
       "status": "success",
       "error": null
@@ -216,10 +254,10 @@ python main.py --output results/my_run.json
   "successful": 3,
   "failed": 0,
   "token_usage": {
-    "prompt_tokens": 12450,
-    "completion_tokens": 890,
-    "total_tokens": 13340,
-    "estimated_cost_usd": 0.0022
+    "prompt_tokens": 12805,
+    "completion_tokens": 2040,
+    "total_tokens": 14845,
+    "estimated_cost_usd": 0.0112
   }
 }
 ```
@@ -229,12 +267,6 @@ python main.py --output results/my_run.json
 ```json
 {
   "domain": "example-unreachable.com",
-  "company_overview": "",
-  "target_audience": "",
-  "contact_points": [],
-  "leadership": [],
-  "confidence_score": 0.0,
-  "sources": [],
   "status": "failed",
   "error": "Crawler returned no pages (site unreachable, blocked, or timed out)"
 }
@@ -244,37 +276,32 @@ python main.py --output results/my_run.json
 
 ## Confidence Score Methodology
 
-The final confidence score (0.0–1.0) is computed deterministically:
-
 | Signal | Weight |
 |---|---|
-| `company_overview` is non-empty (≥ 20 chars) | +0.20 |
-| `target_audience` is non-empty (≥ 10 chars) | +0.15 |
+| `company_overview` present (≥ 20 chars) | +0.20 |
+| `target_audience` present (≥ 10 chars) | +0.15 |
 | At least one `contact_point` found | +0.10 |
 | At least one `leadership` member found | +0.20 |
 | 3 or more pages successfully crawled | +0.15 |
 | LLM's own confidence (weighted 20%) | +0.20 |
 | **Total possible** | **1.00** |
 
-This makes the score explainable and reproducible — interviewers can see exactly how it was derived.
-
 ---
 
-## Error Handling Approach
+## Error Handling
 
 Each domain is wrapped in an independent try/except block. Errors are logged and recorded in the result's `error` field, but the pipeline continues to the next domain.
 
 | Error type | Handling |
 |---|---|
 | Page load timeout | Playwright TimeoutError caught; page skipped |
-| HTTP 404 | Detected from response status; page skipped |
-| HTTP 4xx / 5xx | Logged as warning; page skipped |
+| HTTP 404 / 4xx / 5xx | Detected from response status; page skipped |
 | Navigation / browser crash | Exception caught; domain marked failed |
 | Bot blocker / empty page | Empty extracted text detected; domain marked failed |
-| LLM API error | Caught in `llm.py`; domain marked failed with error message |
-| Rate limit | One automatic retry with 60-second back-off |
-| Malformed LLM output | Pydantic validation catches it; domain marked failed |
-| Missing HTML elements | BeautifulSoup handles gracefully; returns empty string |
+| Groq API error | Caught in `llm.py`; domain marked failed |
+| Rate limit (429) | 15-second back-off + retry |
+| `json_validate_failed` | Retry with trimmed context + `json_object` fallback |
+| Pydantic validation failure | Caught; domain marked failed with error message |
 
 ---
 
@@ -282,8 +309,8 @@ Each domain is wrapped in an independent try/except block. Errors are logged and
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `OPENAI_MODEL` | `gpt-4o-mini` | LLM model for extraction |
+| `GROQ_API_KEY` | *(required)* | Your Groq API key |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Groq model for extraction |
 | `MAX_PAGES_PER_DOMAIN` | `8` | Max pages crawled per domain |
 | `BROWSER_TIMEOUT_SECONDS` | `20` | Playwright page-load timeout |
 | `MAX_CHARS_PER_PAGE` | `4000` | Char limit per page before combining |
@@ -294,21 +321,21 @@ Each domain is wrapped in an independent try/except block. Errors are logged and
 
 ## Limitations
 
-- **Bot blockers**: Some sites (e.g. Cloudflare-protected) may return empty or challenge pages. The pipeline handles this gracefully but cannot bypass all anti-bot measures.
-- **JavaScript-heavy SPAs**: Most React/Vue apps render after `domcontentloaded`. The crawler waits for `networkidle` (with a 5-second timeout) as a best-effort measure.
-- **Dynamic pricing pages**: Some pricing information is loaded client-side and may not be captured in the DOM snapshot.
-- **LinkedIn URLs**: Only included when they appear verbatim in the page content. The LLM is instructed never to guess or construct them.
-- **Rate limits**: The pipeline processes domains sequentially by default. For large batches, set `MAX_CONCURRENCY` accordingly.
+- **Bot blockers**: Some Cloudflare-protected sites may return empty pages. Handled gracefully.
+- **JavaScript SPAs**: The crawler waits for `networkidle` (5s timeout) as a best-effort measure.
+- **Dynamic pricing**: Client-side rendered pricing may not appear in the DOM snapshot.
+- **LinkedIn URLs**: Only included when they appear verbatim in the page content.
+- **Rate limits**: Groq free-tier has per-minute token limits; the pipeline retries automatically.
 
 ---
 
 ## Optional Bonus Features
 
 ### Token / Cost Tracking ✅ (implemented)
-Every run reports total tokens consumed and estimated USD cost in the console summary and in `output/output.json` under `token_usage`.
+Every run reports total tokens consumed and estimated USD cost in the summary and in `output/output.json` under `token_usage`.
 
 ### LinkedIn / Search Integration ❌ (not implemented)
-The assignment marks this as optional. Core requirements take priority. A future implementation could use the Serper or SerpAPI Google Search API to look up LinkedIn profiles.
+Marked as optional in the assignment spec. Core requirements take priority.
 
 ---
 
